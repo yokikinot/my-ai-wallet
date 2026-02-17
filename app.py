@@ -1,143 +1,154 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import matplotlib.pyplot as plt
+from PIL import Image
+import pytesseract
 import datetime
+import re
+from streamlit_gsheets import GSheetsConnection
 
 # ==========================================
-# 1. バックエンド（脳と記憶）
+# 1. 設定・OCRエンジン準備
 # ==========================================
+st.set_page_config(page_title="AI Wallet: Cloud & OCR", layout="wide")
+st.title("🤖 AI Wallet: Personal CFO (Cloud Ver.)")
 
-class DatabaseManager:
-    def __init__(self, db_name="wallet.db"):
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.create_table()
+# ==========================================
+# 2. データベース機能 (Google Sheets)
+# ==========================================
+# スプレッドシートへの接続を作成
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-    def create_table(self):
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                item_name TEXT,
-                amount INTEGER,
-                category TEXT,
-                merchant TEXT
-            )
-        """)
-        self.conn.commit()
+def get_data():
+    # シートからデータを読み込む（キャッシュを使わない設定）
+    try:
+        df = conn.read(ttl=0)
+        return df
+    except:
+        # シートが空の場合の初期データ
+        return pd.DataFrame(columns=["date", "item_name", "amount", "category", "merchant"])
 
-    def add_transaction(self, item_name, amount, category, merchant):
-        date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.cursor.execute("INSERT INTO transactions (date, item_name, amount, category, merchant) VALUES (?, ?, ?, ?, ?)", 
-                            (date, item_name, amount, category, merchant))
-        self.conn.commit()
+def add_data(item_name, amount, category, merchant):
+    # 現在のデータを取得
+    df = get_data()
+    # 新しい行を作成
+    new_row = pd.DataFrame([{
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "item_name": item_name,
+        "amount": amount,
+        "category": category,
+        "merchant": merchant
+    }])
+    # 結合して保存
+    updated_df = pd.concat([df, new_row], ignore_index=True)
+    conn.update(data=updated_df)
+    return updated_df
 
-    def get_all_data(self):
-        # PandasのDataFrameとしてデータを取得（グラフ化しやすくするため）
-        return pd.read_sql("SELECT * FROM transactions", self.conn)
-
-# AIロジック（簡易版）
-def get_ai_advice(category, merchant, amount):
-    advice = {"tax": "", "payment": ""}
-    
-    # 税金アドバイス
-    if category == "medical":
-        advice["tax"] = "💊 これは『医療費控除』の対象です。領収書を保存しました。"
-    elif category == "business":
-        advice["tax"] = "💼 副業の『経費』として計上します。"
-    elif category == "furusato":
-        advice["tax"] = "🎁 ふるさと納税です。住民税の控除対象になります。"
-    else:
-        advice["tax"] = "🛒 通常の消費支出です。"
-
-    # 決済ルートアドバイス
-    if merchant == "Amazon":
-        advice["payment"] = "おすすめ決済: Amazon Prime Card (2.5%)"
-    elif merchant == "Rakuten":
-        advice["payment"] = "おすすめ決済: Rakuten Card (3.0%)"
-    else:
-        advice["payment"] = "おすすめ決済: Main Card (1.0%)"
+# ==========================================
+# 3. AIロジック (OCR & 判定)
+# ==========================================
+def parse_receipt(image):
+    """ レシート画像から文字を読み取る """
+    try:
+        # 日本語モデルでOCR実行
+        text = pytesseract.image_to_string(image, lang='jpn')
         
-    return advice
+        # 簡易的な情報抽出ロジック
+        data = {"merchant": "Unknown", "amount": 0, "category": "private"}
+        
+        # 金額を探す（¥1,000 や 1,000円）
+        amount_match = re.search(r'(合計|¥|￥)\s*([\d,]+)', text)
+        if amount_match:
+            data["amount"] = int(amount_match.group(2).replace(',', ''))
+            
+        # 店名・カテゴリ推測
+        if "セブン" in text or "Seven" in text:
+            data["merchant"] = "SevenEleven"
+            data["category"] = "food"
+        elif "Amazon" in text:
+            data["merchant"] = "Amazon"
+            data["category"] = "private"
+        elif "薬" in text or "ドラッグ" in text:
+            data["merchant"] = "DrugStore"
+            data["category"] = "medical"
+            
+        return text, data
+    except Exception as e:
+        return f"Error: {e}", {}
 
 # ==========================================
-# 2. フロントエンド（見た目・Webアプリ）
+# 4. アプリ画面 (UI)
 # ==========================================
 
-# ページ設定
-st.set_page_config(page_title="My Personal CFO", layout="wide")
-st.title("🤖 AI Wallet: My Personal CFO")
+# --- タブで機能を分ける ---
+tab1, tab2 = st.tabs(["📸 入力・カメラ", "📊 分析ダッシュボード"])
 
-# DB接続
-db = DatabaseManager()
-
-# --- サイドバー：入力フォーム ---
-st.sidebar.header("📝 新しい支出を入力")
-with st.sidebar.form("input_form"):
-    item_name = st.text_input("商品名（例：風邪薬）")
-    amount = st.number_input("金額（円）", min_value=0, step=100)
-    category = st.selectbox("カテゴリー", ["food", "medical", "business", "furusato", "private"])
-    merchant = st.selectbox("購入場所", ["Amazon", "Rakuten", "SevenEleven", "DrugStore", "Other"])
-    
-    submitted = st.form_submit_button("AIに相談して登録")
-
-# --- メインエリア：ロジック実行 ---
-if submitted:
-    # 1. データベースに保存
-    db.add_transaction(item_name, amount, category, merchant)
-    
-    # 2. AIアドバイス生成
-    advice = get_ai_advice(category, merchant, amount)
-    
-    # 3. 結果表示（派手な通知）
-    st.success(f"登録完了: {item_name} ({amount}円)")
+with tab1:
     col1, col2 = st.columns(2)
+    
     with col1:
-        st.info(f"**税務AI**: {advice['tax']}")
+        st.subheader("1. レシートを撮影")
+        # カメラ機能
+        camera_image = st.camera_input("レシートを撮ってください")
+        
+        extracted_info = {}
+        if camera_image:
+            # 画像を処理できる形式に変換
+            img = Image.open(camera_image)
+            st.image(img, caption="撮影画像", width=200)
+            
+            # OCR実行
+            with st.spinner("AIがレシートを読んでいます..."):
+                raw_text, extracted_info = parse_receipt(img)
+                st.info(f"読み取った金額: {extracted_info.get('amount', 0)}円")
+
     with col2:
-        st.warning(f"**決済AI**: {advice['payment']}")
+        st.subheader("2. 内容の確認と登録")
+        # フォーム（OCR結果があれば自動入力）
+        with st.form("input_form"):
+            item_name = st.text_input("商品名", value="レシート読取品" if camera_image else "")
+            
+            # OCRで金額が取れていればそれを初期値にする
+            default_amount = extracted_info.get("amount", 0)
+            amount = st.number_input("金額", min_value=0, step=10, value=default_amount)
+            
+            # OCRでカテゴリが取れていればそれを初期値にする
+            cat_index = 0
+            cats = ["food", "medical", "business", "furusato", "private"]
+            if extracted_info.get("category") in cats:
+                cat_index = cats.index(extracted_info.get("category"))
+                
+            category = st.selectbox("カテゴリー", cats, index=cat_index)
+            merchant = st.text_input("購入場所", value=extracted_info.get("merchant", ""))
+            
+            submitted = st.form_submit_button("クラウドに保存")
 
-# --- ダッシュボードエリア ---
-st.markdown("---")
-st.header("📊 財務ダッシュボード")
+            if submitted:
+                add_data(item_name, amount, category, merchant)
+                st.success("✅ スプレッドシートに保存しました！")
 
-# データの読み込み
-df = db.get_all_data()
-
-if not df.empty:
-    # KPI（重要指標）の表示
-    total_spent = df["amount"].sum()
-    medical_spent = df[df["category"]=="medical"]["amount"].sum()
+with tab2:
+    st.subheader("クラウド上の財務データ")
     
-    kpi1, kpi2, kpi3 = st.columns(3)
-    kpi1.metric("総支出額", f"¥{total_spent:,}")
-    kpi2.metric("医療費控除 対象額", f"¥{medical_spent:,}", delta=f"{medical_spent - 100000}円 (閾値比)")
-    kpi3.metric("データ件数", f"{len(df)}件")
-
-    # グラフ描画エリア
-    chart1, chart2 = st.columns(2)
+    # データを再読み込み
+    df = get_data()
     
-    with chart1:
-        st.subheader("支出の内訳")
-        # カテゴリごとの集計
-        category_sum = df.groupby("category")["amount"].sum()
-        fig1, ax1 = plt.subplots()
-        ax1.pie(category_sum, labels=category_sum.index, autopct='%1.1f%%', startangle=90)
-        st.pyplot(fig1)
-
-    with chart2:
-        st.subheader("医療費控除の進捗 (目標10万円)")
-        # バーチャート
-        progress = min(medical_spent / 100000, 1.0)
-        st.progress(progress)
-        st.caption(f"現在: {medical_spent:,}円 / 目標: 100,000円")
-        if medical_spent > 100000:
-            st.error("✨ 控除ライン突破！確定申告の準備をしましょう！")
-
-    # 履歴データの表示
-    st.subheader("📜 最近の取引履歴")
-    st.dataframe(df.sort_values("id", ascending=False).head(5))
-
-else:
-    st.info("👈 左のサイドバーから、最初の支出データを入力してください。")
+    if not df.empty:
+        # データ表示
+        st.dataframe(df.sort_index(ascending=False).head(5))
+        
+        # グラフ化
+        st.write("---")
+        total = df["amount"].sum()
+        medical = df[df["category"]=="medical"]["amount"].sum()
+        
+        kpi1, kpi2 = st.columns(2)
+        kpi1.metric("総支出", f"¥{total:,}")
+        kpi2.metric("医療費控除 対象額", f"¥{medical:,}", delta=f"{medical-100000}")
+        
+        # 円グラフ
+        fig, ax = plt.subplots()
+        df.groupby("category")["amount"].sum().plot.pie(autopct='%1.1f%%', ax=ax)
+        st.pyplot(fig)
+    else:
+        st.info("まだデータがありません。")
