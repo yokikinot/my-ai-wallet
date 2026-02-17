@@ -3,4 +3,4 @@ pandas
 matplotlib
 pytesseract
 Pillow
-streamlit-gsheets
+st-gsheets-connection
